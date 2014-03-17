@@ -1,0 +1,331 @@
+#!/bin/bash
+# chkconfig: 345 96 20
+# description: Control infamatica process
+#
+# File: /etc/init.d/informatica
+# Purpose: Start and stop the Informatica server
+# Author: bthompso (Conundrum)
+# Date: 3/11/2014
+#
+# Absolutely no warranty, use at your own risk
+# Please include this header in any copy or reuse of the script you make
+#
+# Version 0.01
+#
+# Usage:
+#	1: Create file at /etc/init.d/informatica
+#	2: chmod 750 /etc/init.d/informatica
+#	3: chkconfig --add informatica
+#
+#------------------------------------
+#
+# The following values must be changed for your environment
+#
+
+# full path to the infaservice.sh file
+INFOSERVICE=/APPS/Informatica/9.0.1/server/tomcat/bin
+# log file path, change if you don't want logs to go to /var/log
+LOG_PATH=/var/log
+
+# the following variables should not need modification
+SUBSYS=$(basename $0)
+INFO_FINGERPRINT='Djava.awt.headless=true'
+START_TIMEOUT=300
+STOP_TIMEOUT=300
+LOCK_FILE='/var/lock/subsys/'$SUBSYS
+START_LOG=$LOG_PATH/$SUBSYS-start.log
+STOP_LOG=$LOG_PATH/$SUBSYS-stop.log
+LSOF_PATH=/usr/sbin/lsof
+ORACLE_OWNR=oracle
+# source the functions library
+#-----------------------
+if [ -f /etc/rc.d/init.d/functions ]; then
+      . /etc/rc.d/init.d/functions
+fi
+#-----------------------
+
+# check paths and permissions
+if [ ! -f $INFOSERVICE/infaservice.sh ] ; then
+	echo ''
+	echo -n "**infaservice.sh file not found at $INFOSERVICE/infaservice.sh"
+	echo_failure
+	echo ''
+fi
+
+
+check_permissions() {
+	abort=0
+
+	#check lock file
+	if [ ! -f $LOCK_FILE ] ; then
+		if [ $(touch $LOCK_FILE 2>&1 | grep "Permission denied" | wc -l) -ne 0 ]; then
+			echo ''
+			echo '** Lock file '$LOCK_FILE' is not writable by '$(whoami)' **'
+			echo_failure
+			echo ''
+			abort=1
+		fi
+	else
+		if [ ! -w $LOCK_FILE ]; then
+			echo ''
+			echo '** Lock file '$LOCK_FILE' is not writable by '$(whoami)' **'
+			echo ''
+			abort=1
+		fi
+	fi
+
+	#check start log 
+
+	if [ ! -f $START_LOG ]; then
+		if [ $(touch $START_LOG 2>&1 | grep "Permission denied" | wc -l) -ne 0 ]; then
+			echo ''
+			echo '** Log file '$START_LOG' is not writable by '$(whoami)' **'
+			echo_failure
+			echo ''
+			abort=1
+		fi
+	else
+		if [ ! -w $START_LOG ]; then
+			echo ''
+			echo '** Log file '$START_LOG' is not writable by '$(whoami)' **'
+			echo_failure
+			echo ''
+			abort=1
+		fi
+	fi
+
+
+	#check stop log
+
+	if [ ! -f $STOP_LOG ]; then
+		if [ $(touch $STOP_LOG 2>&1 | grep "Permission denied" | wc -l) -ne 0 ]; then
+			echo ''
+			echo '** Log file '$STOP_LOG' is not writable by '$(whoami)' **'
+			echo_failure
+			echo ''
+			abort=1
+		fi
+	else
+		if [ ! -w $STOP_LOG ]; then
+			echo ''
+			echo '** Log file '$STOP_LOG' is not writable by '$(whoami)' **'
+			echo_failure
+			echo ''
+			abort=1
+		fi
+	fi
+
+	if [ $abort -eq 1 ]; then
+		echo -e '\n\n------------------------\nTo start/stop this script must be run as root (directly, or with sudo)\n\n'
+		exit 255
+	fi
+}
+
+#
+#--------------------
+#
+
+check_process_ports () {
+        # Pass the 'fingerprint' of the process to check, which should be a regex to uniquely
+        # identify the process in a pgrep -f call
+        #
+        # Returns:
+        # 0 - Process not running
+        # 1 - Process running but not listening on any port
+        # <ports> - the port(s) on which the process is listening
+        PID=$(pgrep -f $1)
+        if [ $? -eq 0 ] ; then
+                PORT=$(pgrep -f $1|xargs -I'{}' $LSOF_PATH -nPp {}|grep LISTEN|awk -F ":" '{print $2}'|cut -d " " -f 1|sort -u|paste -s)
+                if [ -n "$PORT" ] ; then
+                        echo $PORT
+                else
+                        echo 1
+                fi
+        else
+                echo 0
+        fi
+}
+
+
+echo_process_status () {
+	rc=$(check_process_ports $1)
+	case "$rc" in
+		0)
+			echo_not_running
+			;;
+		1)	
+			echo_in_progress
+			;;
+		*)
+			echo -n "listening on port" $rc
+			echo_success
+	esac
+	echo ' '
+}
+
+wait_to_die() {
+	# check_process_ports will return 0 (not running), 1 (starting up) or other (port value)
+	# This function will poll the process and based on the value returned (in rc) keep polling,
+	# or after the predefined timeout period, kill the process by force.
+	rc=999
+	timeout=$2
+	if [ -z $timeout ] ; then
+		timeout=600
+	fi
+	# 30 is enough space on the line for the . to appear without overlapping the status message
+	sleep_period=$(($timeout/30))
+	[[ $sleep_period -eq 0 ]] && sleep_period=1
+	fingerprint=$1
+	starttime=$(date +%s)
+	while [ "$rc" != "0" ]
+	do
+		rc=$(check_process_ports $fingerprint)
+		nowtime=$(date +%s)
+		timediff=$(( $nowtime - $starttime ))
+		if [ $timediff -gt $timeout ] ; then
+			echo_warning
+			echo ''
+			echo -e '\tTimed out after '$timeout' seconds'
+			echo -en '\tSending SIGKILL. '
+			pkill -SIGKILL -f $fingerprint
+			sleep 5
+			rc=$(check_process_ports $1)
+			case "$rc" in
+				0)
+					echo -n 'Process killed'
+					echo_success
+					;;
+				*)
+					echo -n "Process still running"
+					echo_failure
+			esac
+			echo ''
+			return 1
+		fi
+		echo -n '.'
+		if [ "$rc" != "0" ] ; then
+			sleep $sleep_period
+		fi
+	done
+	echo_success
+	echo ''
+	return 0
+}
+
+wait_to_start() {
+	# check_process_ports will return 0 (not running), 1 (starting up) or other (port value)
+	# This function will poll the process and based on the value returned (in rc) keep polling,
+	# or after the predefined timeout period, give up.
+	rc=1
+	timeout=$2
+	if [ -z $timeout ] ; then
+		timeout=600
+	fi
+	# 30 is enough space on the line for the . to appear without overlapping the status message
+	sleep_period=$(($timeout/30))
+	[[ $sleep_period -eq 0 ]] && sleep_period=1
+	fingerprint=$1
+	#echo 'Timeout: '$timeout ', Sleep period: '$sleep_period', Fingerprint: '$fingerprint
+	starttime=$(date +%s)
+	while [ "$rc" == "1" ]
+	do
+		sleep $sleep_period
+		rc=$(check_process_ports $fingerprint)
+		nowtime=$(date +%s)
+		timediff=$(( $nowtime - $starttime ))
+		if [ $timediff -gt $timeout ] ; then
+			echo -n ' '
+			echo -n ' (Timed out after '$timeout' seconds ) '
+			break
+		fi
+		echo -n '.'
+	done
+	case "$rc" in
+		0|1)
+			echo_failure
+			rc=255
+			;;
+		*)
+			echo_success
+			rc=0
+			;;
+	esac
+	echo ''
+	#echo '--'
+	#echo $rc
+	#echo '--'
+	return $rc
+}
+
+echo_not_running() {
+	[ "$BOOTUP" = "color" ] && $MOVE_TO_COL
+	echo -n "["
+	[ "$BOOTUP" = "color" ] && $SETCOLOR_FAILURE
+	echo -n $"NOT RUNNING"
+	[ "$BOOTUP" = "color" ] && $SETCOLOR_NORMAL
+	echo -n "]"
+	echo -ne "\r"
+	return 1
+}
+
+echo_in_progress() {
+	[ "$BOOTUP" = "color" ] && $MOVE_TO_COL
+	echo -n "["
+	[ "$BOOTUP" = "color" ] && $SETCOLOR_WARNING
+	echo -n $"IN PROGRESS"
+	[ "$BOOTUP" = "color" ] && $SETCOLOR_NORMAL
+	echo -n "]"
+	echo -ne "\r"
+	return 1
+}
+
+start() {
+	echo -en "\nStarting Informatica Server"
+	su - $ORACLE_OWNR -c "$INFOSERVICE/infaservice.sh startup &" > $START_LOG 2>&1 &
+	wait_to_start $INFO_FINGERPRINT $START_TIMEOUT
+}
+
+stop () {
+	echo -en "\nStopping Informatica Server"
+	su $ORACLE_OWNR -c "$INFOSERVICE/infaservice.sh shutdown" > $STOP_LOG 2>&1 &
+	wait_to_die $INFO_FINGERPRINT $STOP_TIMEOUT
+}
+
+
+
+status () {
+	echo ''
+	echo -n ' Checking Informatica Server: '
+	echo_process_status $INFO_FINGERPRINT
+}
+
+
+case $1 in
+	status)
+		status
+		;;
+	start)
+		check_permissions
+		start
+		echo ''
+		touch $LOCK_FILE
+		;;
+	stop)
+		check_permissions
+		stop
+		rm -f $LOCK_fILE
+		;;
+	restart)
+		check_permissions
+		stop
+		start
+		;;
+	*)
+		echo "Usage: $(basename $0) start|stop|restart|status"
+		;;
+esac
+
+
+
+
+
